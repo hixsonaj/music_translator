@@ -102,6 +102,20 @@ class AudioPipeline:
         print(f"Transcribed {len(segments)} segments")
         return segments
 
+    # ── Voice cleanup ────────────────────────────────────────────────────────
+
+    def delete_voice(self) -> None:
+        """Delete the cloned voice from ElevenLabs to avoid accumulating voices."""
+        if not self.voice_id:
+            return
+        try:
+            self.client.voices.delete(voice_id=self.voice_id)
+            print(f"  Deleted cloned voice: {self.voice_id}")
+        except Exception as e:
+            print(f"  Warning: failed to delete voice {self.voice_id}: {e}")
+        finally:
+            self.voice_id = None
+
     # ── TTS generation ───────────────────────────────────────────────────────
 
     def generate_tts_segment(self, text: str, output_path: str) -> str:
@@ -128,8 +142,8 @@ class AudioPipeline:
             output_format="mp3_44100_128",
             voice_settings=VoiceSettings(
                 stability=0.7,
-                similarity_boost=0.8,
-                style=0.0,
+                similarity_boost=1.0,
+                style=0.1,
                 use_speaker_boost=True,
             )
         )
@@ -330,50 +344,60 @@ class AudioPipeline:
                 print("Pass translated segments with 'translation' key to run().")
                 return transcription
 
-            # Step 1: Use pre-cloned voice or clone a new one
-            if voice_id:
-                self.voice_id = voice_id
-                print(f"Using pre-cloned voice: {self.voice_id}")
-            else:
-                self.clone_voice(vocal_path, singer_name, tmpdir)
+            # Track whether we cloned a new voice (so we know to clean it up)
+            cloned_here = False
 
-            # Step 2: Generate TTS, pitch correct, time-stretch each segment
-            segment_paths = []
-            for i, seg in enumerate(segments):
-                tts_path = os.path.join(tmpdir, f"seg_{i}_tts.mp3")
-                pitch_path = os.path.join(tmpdir, f"seg_{i}_pitch.wav")
-                stretched_path = os.path.join(tmpdir, f"seg_{i}_stretched.wav")
-                target_duration = seg["end"] - seg["start"]
-
-                # Generate TTS
-                self.generate_tts_segment(seg["translation"], tts_path)
-
-                # Optional global pitch correction
-                if pitch_correction:
-                    self.pitch_correct_segment(
-                        tts_path, vocal_path,
-                        seg["start"], seg["end"],
-                        pitch_path,
-                        max_shift_semitones=max_pitch_shift,
-                    )
+            try:
+                # Step 1: Use pre-cloned voice or clone a new one
+                if voice_id:
+                    self.voice_id = voice_id
+                    print(f"Using pre-cloned voice: {self.voice_id}")
                 else:
-                    shutil.copy(tts_path, pitch_path)
+                    self.clone_voice(vocal_path, singer_name, tmpdir)
+                    cloned_here = True
 
-                # Time-stretch to match original duration
-                self.time_stretch_segment(pitch_path, stretched_path, target_duration)
-                segment_paths.append(stretched_path)
+                # Step 2: Generate TTS, pitch correct, time-stretch each segment
+                segment_paths = []
+                for i, seg in enumerate(segments):
+                    tts_path = os.path.join(tmpdir, f"seg_{i}_tts.mp3")
+                    pitch_path = os.path.join(tmpdir, f"seg_{i}_pitch.wav")
+                    stretched_path = os.path.join(tmpdir, f"seg_{i}_stretched.wav")
+                    target_duration = seg["end"] - seg["start"]
 
-            # Step 3: Assemble vocal track
-            total_duration = max(seg["end"] for seg in segments) + 1.0
-            vocal_track_path = os.path.join(tmpdir, "translated_vocals.mp3")
-            self.assemble_vocal_track(
-                segments, segment_paths, total_duration, vocal_track_path
-            )
+                    # Generate TTS
+                    self.generate_tts_segment(seg["translation"], tts_path)
 
-            # Step 4: Mix with instrumental
-            self.mix_with_instrumental(
-                vocal_track_path, instrumental_path, output_path,
-            )
+                    # Optional global pitch correction
+                    if pitch_correction:
+                        self.pitch_correct_segment(
+                            tts_path, vocal_path,
+                            seg["start"], seg["end"],
+                            pitch_path,
+                            max_shift_semitones=max_pitch_shift,
+                        )
+                    else:
+                        shutil.copy(tts_path, pitch_path)
+
+                    # Time-stretch to match original duration
+                    self.time_stretch_segment(pitch_path, stretched_path, target_duration)
+                    segment_paths.append(stretched_path)
+
+                # Step 3: Assemble vocal track
+                total_duration = max(seg["end"] for seg in segments) + 1.0
+                vocal_track_path = os.path.join(tmpdir, "translated_vocals.mp3")
+                self.assemble_vocal_track(
+                    segments, segment_paths, total_duration, vocal_track_path
+                )
+
+                # Step 4: Mix with instrumental
+                self.mix_with_instrumental(
+                    vocal_track_path, instrumental_path, output_path,
+                )
+            finally:
+                # Clean up the cloned voice from ElevenLabs
+                if cloned_here:
+                    self.delete_voice()
+                self._tts_cache.clear()
 
         return output_path
 
