@@ -1,4 +1,0 @@
-yt-dlp>=2024.8.6
-imageio-ffmpeg>=0.5.1
-openai-whisper>=20231117
-openai>=1.40.0
