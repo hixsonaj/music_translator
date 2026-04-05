@@ -20,6 +20,9 @@ import json
 import re
 from datetime import datetime
 from uuid import uuid4
+from dotenv import load_dotenv
+
+load_dotenv(".env/keys.env")
 
 from uagents import Agent, Context, Protocol
 from uagents_core.contrib.protocols.chat import (
@@ -55,7 +58,7 @@ orchestrator = Agent(
     seed=os.getenv("ORCHESTRATOR_SEED", "orchestrator_seed_phrase"),
     port=8000,
     mailbox=True,               # Required for ASI:One to reach you
-    agentverse={"api_key": "AGENTVERSE_API_KEY"},
+    agentverse={"api_key": os.getenv("AGENTVERSE_API_KEY")},    
     publish_agent_details=True, # Makes it discoverable on Agentverse
 )
 

@@ -7,3 +7,6 @@ uagents
 uagents-core
 anthropic
 pyrubberband
+scipy
+python-dotenv
+openai-whisper

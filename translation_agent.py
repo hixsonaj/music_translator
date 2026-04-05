@@ -1,7 +1,10 @@
 import os
+from dotenv import load_dotenv
 from uagents import Agent, Context
 from models import LyricLine, RevisionRequest
 import anthropic
+
+load_dotenv(".env/keys.env")
 
 client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
