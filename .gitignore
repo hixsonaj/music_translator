@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+*.wav
+*.mp3
+*.flac
+separated/
+agent1qga4t2sj75_data.json

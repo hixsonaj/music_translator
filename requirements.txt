@@ -1,0 +1,9 @@
+numpy
+elevenlabs
+pydub
+librosa
+soundfile
+uagents
+uagents-core
+anthropic
+pyrubberband
