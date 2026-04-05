@@ -143,7 +143,7 @@ class AudioPipeline:
             voice_settings=VoiceSettings(
                 stability=0.7,
                 similarity_boost=1.0,
-                style=0.1,
+                style=0.0,
                 use_speaker_boost=True,
             )
         )
@@ -206,6 +206,122 @@ class AudioPipeline:
         sf.write(output_path, y_shifted, sr)
         return output_path
 
+    # ── Pause detection ──────────────────────────────────────────────────────
+
+    def _find_all_gaps(
+        self, vocal_path: str, segments: list[dict], top_db: int = 30,
+    ) -> tuple[list[float], float]:
+        """
+        Scan only the voiced portions of the track (within segment
+        boundaries) and collect the duration of every silent gap.
+        This excludes the long silences *between* lines so they don't
+        skew the threshold.
+
+        Returns (all_gap_durations, threshold_sec).
+        The threshold is set at  mean + 1.5 * std  of the intra-line
+        gap durations, floored at  median * 1.5  — whichever is larger.
+        """
+        frame_length = 2048
+        hop_length = 512
+        gaps = []
+
+        for seg in segments:
+            duration = seg["end"] - seg["start"]
+            if duration < 0.1:
+                continue
+            y_seg, sr = librosa.load(
+                vocal_path, sr=None, offset=seg["start"], duration=duration,
+            )
+            if len(y_seg) == 0:
+                continue
+
+            rms = librosa.feature.rms(y=y_seg, frame_length=frame_length, hop_length=hop_length)[0]
+            threshold_amp = np.max(rms) * (10 ** (-top_db / 20.0))
+            is_silent = rms < threshold_amp
+
+            in_silence = False
+            silence_start = 0
+            total_frames = len(rms)
+            for i, silent in enumerate(is_silent):
+                if silent and not in_silence:
+                    in_silence = True
+                    silence_start = i
+                elif not silent and in_silence:
+                    in_silence = False
+                    # Skip leading/trailing silence within this segment
+                    start_frac = silence_start / total_frames
+                    end_frac = i / total_frames
+                    if start_frac < 0.05 or end_frac > 0.95:
+                        continue
+                    dur = (i - silence_start) * hop_length / sr
+                    if dur > 0.02:  # ignore sub-20ms noise
+                        gaps.append(dur)
+
+        if len(gaps) < 3:
+            # Not enough internal gaps — conservative fallback
+            return gaps, 0.2
+
+        gaps_arr = np.array(gaps)
+        mean_gap = np.mean(gaps_arr)
+        std_gap = np.std(gaps_arr)
+        median_gap = np.median(gaps_arr)
+
+        # Threshold: gaps significantly longer than normal
+        stat_threshold = mean_gap + 1.5 * std_gap
+        median_threshold = median_gap * 1.5
+        pause_threshold = max(stat_threshold, median_threshold, 0.08)
+
+        return gaps, float(pause_threshold)
+
+    def _detect_pauses(
+        self, y: np.ndarray, sr: int, min_pause_sec: float = 0.15, top_db: int = 30,
+    ) -> list[dict]:
+        """
+        Find significant internal pauses in an audio signal.
+
+        Args:
+            min_pause_sec: minimum gap duration (in seconds) to be considered
+                a pause.  Use _find_all_gaps() on the full track to compute
+                this adaptively.
+
+        Returns list of {start_frac, end_frac, duration_sec} — fractional
+        positions (0.0–1.0) and absolute duration of each pause.
+        """
+        frame_length = 2048
+        hop_length = 512
+        rms = librosa.feature.rms(y=y, frame_length=frame_length, hop_length=hop_length)[0]
+
+        threshold = np.max(rms) * (10 ** (-top_db / 20.0))
+        is_silent = rms < threshold
+        total_duration = len(y) / sr
+
+        pauses = []
+        in_silence = False
+        silence_start = 0
+        for i, silent in enumerate(is_silent):
+            if silent and not in_silence:
+                in_silence = True
+                silence_start = i
+            elif not silent and in_silence:
+                in_silence = False
+                start_sec = silence_start * hop_length / sr
+                end_sec = i * hop_length / sr
+                duration = end_sec - start_sec
+                if duration >= min_pause_sec:
+                    pauses.append({
+                        "start_frac": start_sec / total_duration,
+                        "end_frac": end_sec / total_duration,
+                        "duration_sec": duration,
+                    })
+
+        # Exclude leading/trailing silence — only keep internal pauses
+        if pauses and pauses[0]["start_frac"] < 0.05:
+            pauses.pop(0)
+        if pauses and pauses[-1]["end_frac"] > 0.95:
+            pauses.pop()
+
+        return pauses
+
     # ── Time stretching ──────────────────────────────────────────────────────
 
     def time_stretch_segment(
@@ -213,24 +329,70 @@ class AudioPipeline:
         input_path: str,
         output_path: str,
         target_duration_seconds: float,
+        pauses: list[dict] = None,
     ) -> str:
         """
-        Time-stretch or compress the audio to match the target duration.
-        Uses pyrubberband for higher quality than librosa's phase vocoder.
+        Time-stretch audio to match target duration.  If pauses are provided,
+        pause durations are preserved and only speech portions are stretched.
         """
         y, sr = librosa.load(input_path, sr=None)
         current_duration = len(y) / sr
 
-        if abs(current_duration - target_duration_seconds) < 0.05:
+        if abs(current_duration - target_duration_seconds) < 0.05 and not pauses:
             shutil.copy(input_path, output_path)
             return output_path
 
-        rate = current_duration / target_duration_seconds
-        rate = max(0.5, min(2.0, rate))
+        if not pauses:
+            # Simple uniform stretch (original behavior)
+            rate = current_duration / target_duration_seconds
+            rate = max(0.5, min(2.0, rate))
+            print(f"  Stretching: {current_duration:.2f}s → {target_duration_seconds:.2f}s (rate={rate:.2f})")
+            y_stretched = pyrb.time_stretch(y, sr, rate)
+        else:
+            # Pause-aware: preserve pause durations, stretch only speech
+            total_pause_dur = sum(p["duration_sec"] for p in pauses)
+            speech_target = target_duration_seconds - total_pause_dur
+            total_samples = len(y)
 
-        print(f"  Stretching: {current_duration:.2f}s → {target_duration_seconds:.2f}s (rate={rate:.2f})")
+            if speech_target <= 0.1:
+                rate = current_duration / target_duration_seconds
+                rate = max(0.5, min(2.0, rate))
+                y_stretched = pyrb.time_stretch(y, sr, rate)
+            else:
+                # Split TTS at proportional pause positions
+                regions = []
+                prev_end = 0
+                for p in pauses:
+                    pause_pos = int(p["start_frac"] * total_samples)
+                    pause_pos = max(prev_end, min(pause_pos, total_samples))
+                    if pause_pos > prev_end:
+                        regions.append(("speech", y[prev_end:pause_pos]))
+                    regions.append(("pause", p["duration_sec"]))
+                    prev_end = pause_pos
+                if prev_end < total_samples:
+                    regions.append(("speech", y[prev_end:]))
 
-        y_stretched = pyrb.time_stretch(y, sr, rate)
+                total_speech_dur = sum(len(r[1]) / sr for r in regions if r[0] == "speech")
+
+                if total_speech_dur < 0.05:
+                    rate = current_duration / target_duration_seconds
+                    rate = max(0.5, min(2.0, rate))
+                    y_stretched = pyrb.time_stretch(y, sr, rate)
+                else:
+                    speech_rate = total_speech_dur / speech_target
+                    speech_rate = max(0.5, min(2.0, speech_rate))
+
+                    pause_desc = [f"{p['duration_sec']:.2f}s@{int(p['start_frac']*100)}%" for p in pauses]
+                    print(f"  Pause-aware stretch: {len(pauses)} pause(s) [{', '.join(pause_desc)}], "
+                          f"speech rate={speech_rate:.2f}")
+
+                    parts = []
+                    for rtype, rdata in regions:
+                        if rtype == "speech" and len(rdata) > 0:
+                            parts.append(pyrb.time_stretch(rdata, sr, speech_rate))
+                        elif rtype == "pause":
+                            parts.append(np.zeros(int(rdata * sr)))
+                    y_stretched = np.concatenate(parts)
 
         # Trim or pad to exact target length
         target_samples = int(target_duration_seconds * sr)
@@ -356,7 +518,18 @@ class AudioPipeline:
                     self.clone_voice(vocal_path, singer_name, tmpdir)
                     cloned_here = True
 
-                # Step 2: Generate TTS, pitch correct, time-stretch each segment
+                # Step 2: Analyze intra-line gaps for adaptive pause threshold
+                all_gaps, pause_threshold = self._find_all_gaps(vocal_path, segments)
+                if all_gaps:
+                    print(f"  Pause analysis: {len(all_gaps)} intra-line gaps, "
+                          f"threshold={pause_threshold*1000:.0f}ms "
+                          f"(mean={np.mean(all_gaps)*1000:.0f}ms, "
+                          f"median={np.median(all_gaps)*1000:.0f}ms, "
+                          f"std={np.std(all_gaps)*1000:.0f}ms)")
+                else:
+                    print(f"  Pause analysis: no intra-line gaps found, using {pause_threshold*1000:.0f}ms fallback")
+
+                # Step 3: Generate TTS, pitch correct, time-stretch each segment
                 segment_paths = []
                 for i, seg in enumerate(segments):
                     tts_path = os.path.join(tmpdir, f"seg_{i}_tts.mp3")
@@ -378,8 +551,17 @@ class AudioPipeline:
                     else:
                         shutil.copy(tts_path, pitch_path)
 
-                    # Time-stretch to match original duration
-                    self.time_stretch_segment(pitch_path, stretched_path, target_duration)
+                    # Detect significant pauses in the original vocal
+                    y_orig_seg, sr_orig = librosa.load(
+                        vocal_path, sr=None,
+                        offset=seg["start"], duration=target_duration,
+                    )
+                    pauses = self._detect_pauses(y_orig_seg, sr_orig, min_pause_sec=pause_threshold)
+                    if pauses:
+                        print(f"  Detected {len(pauses)} internal pause(s) in original")
+
+                    # Time-stretch to match original duration (pause-aware)
+                    self.time_stretch_segment(pitch_path, stretched_path, target_duration, pauses=pauses)
                     segment_paths.append(stretched_path)
 
                 # Step 3: Assemble vocal track
@@ -402,55 +584,64 @@ class AudioPipeline:
         return output_path
 
 
-# ── Example usage ─────────────────────────────────────────────────────────────
+# ── Full end-to-end usage ─────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import re
+    import json
+    import argparse
     import anthropic
+    from pre_pipeline import run as run_pre_pipeline
 
+    parser = argparse.ArgumentParser(description="Translate a song end-to-end")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--url",  help="YouTube or direct audio URL")
+    group.add_argument("--file", help="Path to local audio file")
+    group.add_argument("--segments-json", help="Skip pre-pipeline, use existing segments.json + separated audio")
+    parser.add_argument("--lang", default="es", help="Target language code (default: es)")
+    parser.add_argument("--lang-name", default="Spanish", help="Full language name for translation prompt")
+    parser.add_argument("--source-lang", default="en", help="Source language code (default: en)")
+    parser.add_argument("--whisper-model", default="medium", help="Whisper model size")
+    parser.add_argument("--output", default="translated_song.mp3", help="Output path")
+    parser.add_argument("--vocals", help="Path to vocals wav (required with --segments-json)")
+    parser.add_argument("--instrumental", help="Path to instrumental wav (required with --segments-json)")
+    parser.add_argument("--output-dir", default="separated", help="Demucs output directory")
+    args = parser.parse_args()
+
+    # ── Step 1: Get vocals, instrumental, and transcribed segments ─────
+    if args.segments_json:
+        # Use pre-existing segments and audio
+        if not args.vocals or not args.instrumental:
+            parser.error("--vocals and --instrumental are required with --segments-json")
+        with open(args.segments_json) as f:
+            segments = json.load(f)
+        vocal_path = args.vocals
+        instrumental_path = args.instrumental
+        print(f"Loaded {len(segments)} segments from {args.segments_json}")
+    else:
+        # Run full pre-pipeline: download (if URL) -> demucs -> whisper
+        pre_result = run_pre_pipeline(
+            url=args.url,
+            file=args.file,
+            output_dir=args.output_dir,
+            source_lang=args.source_lang,
+            whisper_model=args.whisper_model,
+        )
+        segments = pre_result["segments"]
+        vocal_path = pre_result["vocals_path"]
+        instrumental_path = pre_result["instrumental_path"]
+
+    # ── Step 2: Translate via Claude ──────────────────────────────────
     claude = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
-
-    pipeline = AudioPipeline(
-        elevenlabs_api_key=os.environ.get("ELEVENLABS_API_KEY", "sk_...")
-    )
-
-    segments = [
-        {"start": 0.0, "end": 5.1, "text": "You wouldn't get this from any other guy."},
-        {"start": 5.6, "end": 9.8, "text": "I just want to tell you how I'm feeling."},
-        {"start": 10.4, "end": 12.8, "text": "Gotta make you understand."},
-        {"start": 13.2, "end": 15.1, "text": "Never gonna give you up."},
-        {"start": 15.4, "end": 17.1, "text": "Never gonna let you down."},
-        {"start": 17.4, "end": 21.2, "text": "Never gonna run around and desert you."},
-        {"start": 21.5, "end": 23.4, "text": "Never gonna make you cry."},
-        {"start": 23.7, "end": 25.4, "text": "Never gonna say goodbye."},
-        {"start": 25.8, "end": 29.0, "text": "Never gonna tell a lie and hurt you."},
-        {"start": 30.3, "end": 34.7, "text": "We've known each other for so long."},
-        {"start": 35.2, "end": 39.4, "text": "Your heart's been aching but you're too shy to say it."},
-        {"start": 39.4, "end": 42.4, "text": "Inside we both know what's been going on."},
-        {"start": 43.6, "end": 47.4, "text": "We know the game and we're gonna play it."},
-        {"start": 48.4, "end": 51.9, "text": "And if you ask me how I'm feeling,"},
-        {"start": 52.3, "end": 55.1, "text": "Don't tell me you're too blind to see."},
-        {"start": 55.4, "end": 57.3, "text": "Never gonna give you up."},
-        {"start": 57.3, "end": 59.4, "text": "Never gonna let you down."},
-        {"start": 59.7, "end": 63.4, "text": "Never gonna run around and desert you."},
-        {"start": 63.8, "end": 65.7, "text": "Never gonna make you cry."},
-        {"start": 66.0, "end": 67.7, "text": "Never gonna say goodbye."},
-        {"start": 68.1, "end": 72.0, "text": "Never gonna tell a lie and hurt you."},
-        {"start": 72.3, "end": 78.4, "text": "Never gonna make you cry."},
-        {"start": 82.9, "end": 84.6, "text": "Never gonna say goodbye."},
-    ]
-
-    # ── Translate via Claude directly ─────────────────────────────────────
-    target_lang = "es"
+    target_lang = args.lang_name
     text_cache = {}  # text -> translation (reuse for duplicate lyrics)
 
-    # Deduplicate
     unique_texts = list({seg["text"] for seg in segments})
     total_segments = len(segments)
-    print(f"{total_segments} segments, {len(unique_texts)} unique lyrics to translate "
+    print(f"\n{total_segments} segments, {len(unique_texts)} unique lyrics to translate "
           f"({total_segments - len(unique_texts)} duplicates skipped)")
 
-    def translate_line(text: str, lang: str = "Spanish") -> str:
+    def translate_line(text: str, lang: str = target_lang) -> str:
         syllable_count = max(1, len(re.findall(r'[aeiouAEIOU]+', text)))
         response = claude.messages.create(
             model="claude-haiku-4-5-20251001",
@@ -474,12 +665,16 @@ if __name__ == "__main__":
     for seg in segments:
         seg["translation"] = text_cache[seg["text"]]
 
-    # ── Run pipeline (will clone a fresh voice) ────────────────────────
+    # ── Step 3: Run audio pipeline ────────────────────────────────────
+    pipeline = AudioPipeline(
+        elevenlabs_api_key=os.environ.get("ELEVENLABS_API_KEY", "sk_...")
+    )
+
     result = pipeline.run(
-        vocal_path="separated/htdemucs/test_song/vocals_short.wav",
-        instrumental_path="separated/htdemucs/test_song/no_vocals_short.wav",
+        vocal_path=vocal_path,
+        instrumental_path=instrumental_path,
         segments=segments,
-        output_path="translated_song.mp3",
+        output_path=args.output,
         pitch_correction=True,
         max_pitch_shift=2.0,
     )

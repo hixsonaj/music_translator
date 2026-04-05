@@ -128,18 +128,24 @@ def transcribe(vocals_path: str, source_lang: str = "en", whisper_model: str = "
     Run Whisper on the vocal track to get timestamped segments.
     Returns list of {"start", "end", "text"} dicts.
     """
-    print(f"Transcribing with Whisper ({whisper_model})...")
+    import hashlib
+    cache_path = vocals_path + ".whisper.json"
+    if os.path.exists(cache_path):
+        print(f"Loading cached Whisper transcript: {cache_path}")
+        with open(cache_path, "r") as f:
+            segments = json.load(f)
+        print(f"  {len(segments)} segments loaded from cache")
+        return segments
 
+    print(f"Transcribing with Whisper ({whisper_model})...")
     import whisper
     model = whisper.load_model(whisper_model)
-
     result = model.transcribe(
         vocals_path,
         language=source_lang,
         word_timestamps=True,
         verbose=False,
     )
-
     segments = []
     for seg in result["segments"]:
         text = seg["text"].strip()
@@ -151,8 +157,10 @@ def transcribe(vocals_path: str, source_lang: str = "en", whisper_model: str = "
             "text": text,
         })
         print(f"  [{seg['start']:.2f}s – {seg['end']:.2f}s] {text}")
-
     print(f"  {len(segments)} segments found")
+    # Save to cache
+    with open(cache_path, "w") as f:
+        json.dump(segments, f, indent=2, ensure_ascii=False)
     return segments
 
 

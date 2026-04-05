@@ -1,4 +1,4 @@
-.venv/
+.venv*/
 __pycache__/
 *.pyc
 .env
@@ -8,3 +8,4 @@ __pycache__/
 separated/
 agent1qga4t2sj75_data.json
 translated_song.mp3
+segments.json

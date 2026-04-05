@@ -1,4 +1,11 @@
-numpy
+numpy<2
+torch==2.1.2
+torchaudio==2.1.2
+torchcodec==0.2.0
+demucs
+yt-dlp
+openai-whisper
+pyphen
 elevenlabs
 pydub
 librosa
@@ -9,4 +16,3 @@ anthropic
 pyrubberband
 scipy
 python-dotenv
-openai-whisper
