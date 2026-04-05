@@ -1,35 +1,3 @@
-"""
-Post-Translation Audio Pipeline
----------------------------------
-Takes translated lyrics + Whisper segments and produces a final
-remixed audio file with the translated vocals over the instrumental.
-
-Pipeline:
-  1. Clone the singer's voice from the separated vocal track
-  2. Generate TTS for each translated line in the cloned voice
-  3. (Optional) Global per-segment pitch correction
-  4. Time-stretch each segment to match original duration
-  5. Reassemble all segments into a full vocal track
-  6. Mix translated vocals over the instrumental
-
-Requirements:
-  pip install elevenlabs pydub librosa soundfile numpy pyrubberband
-
-Usage:
-  from audio_pipeline import AudioPipeline
-
-  pipeline = AudioPipeline(elevenlabs_api_key="sk_...")
-  pipeline.run(
-      vocal_path="vocals.mp3",
-      instrumental_path="instrumental.mp3",
-      segments=[
-          {"start": 0.0, "end": 2.1, "translation": "Nunca te voy a soltar"},
-          {"start": 2.1, "end": 4.2, "translation": "Nunca te voy a decepcionar"},
-      ],
-      output_path="final_output.mp3",
-  )
-"""
-
 import os
 import shutil
 import tempfile
@@ -52,15 +20,18 @@ class AudioPipeline:
     def __init__(self, elevenlabs_api_key: str):
         self.client = ElevenLabs(api_key=elevenlabs_api_key)
         self.voice_id = None
-        self._tts_cache = {}  # text -> file path — avoids duplicate API calls
 
-    # ── Voice cloning ────────────────────────────────────────────────────────
+        # 🔥 Stable cache directory (prevents temp overwrite bugs)
+        self.cache_dir = os.path.join(tempfile.gettempdir(), "tts_cache")
+        os.makedirs(self.cache_dir, exist_ok=True)
+
+        self._tts_cache = {}  # text -> cache file path
+
+    # ── Voice cloning ─────────────────────────────────────────────
 
     def clone_voice(self, vocal_path: str, singer_name: str = "singer", tmpdir: str = None) -> str:
-        """Clone a single voice from the vocal track."""
         print(f"Cloning voice from {vocal_path}...")
 
-        # Convert to mp3 for ElevenLabs if needed
         if vocal_path.endswith(".wav"):
             mp3_path = os.path.join(tmpdir, "vocal_sample.mp3")
             AudioSegment.from_wav(vocal_path).export(mp3_path, format="mp3")
@@ -73,66 +44,41 @@ class AudioPipeline:
                 description=f"Singer voice ({singer_name})",
                 files=[("vocals.mp3", f, "audio/mpeg")],
             )
+
         self.voice_id = voice.voice_id
         print(f"  Cloned '{singer_name}': {self.voice_id}")
         return self.voice_id
 
-    # ── Transcription ────────────────────────────────────────────────────────
-
-    def transcribe_vocals(self, vocal_path: str, model_size: str = "medium") -> list[dict]:
-        """Transcribe the vocal track using OpenAI Whisper."""
-        print(f"Transcribing vocals with Whisper ({model_size})...")
-
-        model = whisper.load_model(model_size)
-        result = model.transcribe(
-            vocal_path,
-            word_timestamps=True,
-            verbose=False,
-        )
-
-        segments = []
-        for seg in result["segments"]:
-            segments.append({
-                "start": seg["start"],
-                "end": seg["end"],
-                "text": seg["text"].strip(),
-            })
-            print(f"  [{seg['start']:.1f}s - {seg['end']:.1f}s] {seg['text'].strip()}")
-
-        print(f"Transcribed {len(segments)} segments")
-        return segments
-
-    # ── Voice cleanup ────────────────────────────────────────────────────────
-
-    def delete_voice(self) -> None:
-        """Delete the cloned voice from ElevenLabs to avoid accumulating voices."""
+    def delete_voice(self):
         if not self.voice_id:
             return
         try:
             self.client.voices.delete(voice_id=self.voice_id)
             print(f"  Deleted cloned voice: {self.voice_id}")
         except Exception as e:
-            print(f"  Warning: failed to delete voice {self.voice_id}: {e}")
+            print(f"  Warning: failed to delete voice: {e}")
         finally:
             self.voice_id = None
 
-    # ── TTS generation ───────────────────────────────────────────────────────
+    # ── TTS ───────────────────────────────────────────────────────
 
     def generate_tts_segment(self, text: str, output_path: str) -> str:
-        """
-        Generate speech for a translated line using the cloned voice.
-        Results are cached by text so duplicate lyrics reuse the same audio.
-        """
         if not self.voice_id:
-            raise ValueError("Must clone voice first — call clone_voice()")
+            raise ValueError("Must clone voice first")
 
-        # Return cached version if available
-        if text in self._tts_cache:
-            cached_path = self._tts_cache[text]
+        cache_path = os.path.join(self.cache_dir, f"{hash(text)}.wav")
+
+        # Cache hit
+        if text in self._tts_cache and os.path.exists(self._tts_cache[text]):
+            cached = self._tts_cache[text]
+
+            if os.path.abspath(cached) != os.path.abspath(output_path):
+                shutil.copy(cached, output_path)
+
             print(f"  TTS cache hit: '{text}'")
-            shutil.copy(cached_path, output_path)
             return output_path
 
+        # Generate
         print(f"  Generating TTS: '{text}'")
 
         audio = self.client.text_to_speech.convert(
@@ -148,272 +94,296 @@ class AudioPipeline:
             )
         )
 
-        with open(output_path, "wb") as f:
+        with open(cache_path, "wb") as f:
             for chunk in audio:
                 if isinstance(chunk, bytes):
                     f.write(chunk)
 
-        self._tts_cache[text] = output_path
+        shutil.copy(cache_path, output_path)
+        self._tts_cache[text] = cache_path
+
         return output_path
 
-    # ── Global pitch correction (optional) ───────────────────────────────────
+    # ── Phrase detection ──────────────────────────────────────────
+
+    def _detect_phrase_boundaries(self, audio, sr):
+        hop_length = 512
+
+        onset_frames = librosa.onset.onset_detect(
+            y=audio, sr=sr, hop_length=hop_length, backtrack=True
+        )
+        onset_samples = librosa.frames_to_samples(onset_frames, hop_length=hop_length)
+
+        rms = librosa.feature.rms(y=audio, hop_length=hop_length)[0]
+        rms = rms / (np.max(rms) + 1e-8)
+
+        silence_frames = np.where(rms < 0.1)[0]
+        silence_samples = librosa.frames_to_samples(silence_frames, hop_length=hop_length)
+
+        boundaries = np.concatenate(([0], onset_samples, silence_samples, [len(audio)]))
+        boundaries = np.unique(boundaries)
+
+        min_len = int(0.15 * sr)
+        merged = [boundaries[0]]
+
+        for b in boundaries[1:]:
+            if b - merged[-1] < min_len:
+                continue
+            merged.append(b)
+
+        return np.array(merged)
+
+    def _should_split_phrase(self, audio, sr):
+        duration = len(audio) / sr
+        if duration < 2.5:
+            return False
+
+        bounds = self._detect_phrase_boundaries(audio, sr)
+        return (len(bounds) - 1) >= 3
+
+    # ── Phrase-based TTS ──────────────────────────────────────────
+
+    def generate_phrase_spliced_segment(
+        self,
+        text,
+        vocal_path,
+        seg_start,
+        seg_end,
+        output_path,
+        tmpdir,
+    ):
+        y_orig, sr = librosa.load(
+            vocal_path, sr=None,
+            offset=seg_start,
+            duration=seg_end - seg_start
+        )
+
+        if len(y_orig) == 0 or not self._should_split_phrase(y_orig, sr):
+            return self.generate_tts_segment(text, output_path)
+
+        bounds = self._detect_phrase_boundaries(y_orig, sr)
+
+        min_phrase_duration = 0.35
+
+        phrase_durations = [
+            max((bounds[i+1] - bounds[i]) / sr, min_phrase_duration)
+            for i in range(len(bounds) - 1)
+        ]
+
+        words = text.split()
+        n = len(phrase_durations)
+
+        if n <= 1 or len(words) < 4:
+            return self.generate_tts_segment(text, output_path)
+
+        splits = np.linspace(0, len(words), n + 1, dtype=int)
+
+        chunks = [
+            " ".join(words[splits[i]:splits[i+1]])
+            for i in range(n)
+            if splits[i] < splits[i+1]
+        ]
+
+        print(f"  Phrase splitting into {len(chunks)} chunks")
+
+        audio_chunks = []
+
+        for i, chunk_text in enumerate(chunks):
+            chunk_path = os.path.join(tmpdir, f"phrase_{i}_{hash(chunk_text)}.wav")
+            stretched_path = os.path.join(tmpdir, f"phrase_{i}_stretch.wav")
+
+            self.generate_tts_segment(chunk_text, chunk_path)
+
+            self.time_stretch_segment(
+                chunk_path,
+                stretched_path,
+                phrase_durations[i]
+            )
+
+            y_chunk, _ = librosa.load(stretched_path, sr=sr)
+            audio_chunks.append(y_chunk)
+
+        result = audio_chunks[0]
+        crossfade = int(0.01 * sr)
+
+        for chunk in audio_chunks[1:]:
+            cf = min(crossfade, len(result), len(chunk))
+            if cf > 1:
+                fade_out = np.linspace(1, 0, cf)
+                fade_in = np.linspace(0, 1, cf)
+                result[-cf:] = result[-cf:] * fade_out + chunk[:cf] * fade_in
+                result = np.concatenate([result, chunk[cf:]])
+            else:
+                result = np.concatenate([result, chunk])
+
+        sf.write(output_path, result, sr)
+        return output_path
+
+    # ── Pitch ─────────────────────────────────────────────────────
 
     def pitch_correct_segment(
         self,
-        tts_path: str,
-        vocal_path: str,
-        seg_start: float,
-        seg_end: float,
-        output_path: str,
-        max_shift_semitones: float = 2.0,
-    ) -> str:
-        """
-        Apply a single global pitch shift to align the TTS median F0
-        with the original vocal's median F0 for this segment.
-
-        Shift is clamped to ±max_shift_semitones to avoid artifacts.
-        """
+        tts_path,
+        vocal_path,
+        seg_start,
+        seg_end,
+        output_path,
+        max_shift_semitones=2.0,
+    ):
         y_tts, sr = librosa.load(tts_path, sr=None)
         y_orig, _ = librosa.load(
-            vocal_path, sr=sr, offset=seg_start, duration=seg_end - seg_start,
+            vocal_path, sr=sr,
+            offset=seg_start,
+            duration=seg_end - seg_start,
         )
 
         if len(y_orig) == 0 or len(y_tts) == 0:
             shutil.copy(tts_path, output_path)
             return output_path
 
-        # Extract median F0 from both
         orig_f0, _, _ = librosa.pyin(y_orig, fmin=80, fmax=600, sr=sr)
         tts_f0, _, _ = librosa.pyin(y_tts, fmin=80, fmax=600, sr=sr)
 
-        orig_voiced = orig_f0[orig_f0 > 0]
-        tts_voiced = tts_f0[tts_f0 > 0]
+        orig = orig_f0[orig_f0 > 0]
+        tts = tts_f0[tts_f0 > 0]
 
-        if len(orig_voiced) == 0 or len(tts_voiced) == 0:
+        if len(orig) == 0 or len(tts) == 0:
             shutil.copy(tts_path, output_path)
             return output_path
 
-        shift = 12 * np.log2(np.median(orig_voiced) / np.median(tts_voiced))
+        shift = 12 * np.log2(np.median(orig) / np.median(tts))
         shift = float(np.clip(shift, -max_shift_semitones, max_shift_semitones))
 
         if abs(shift) < 0.1:
-            print(f"  Pitch: no correction needed ({shift:+.1f} st)")
             shutil.copy(tts_path, output_path)
             return output_path
 
-        print(f"  Pitch: {shift:+.1f} semitones (orig {np.median(orig_voiced):.0f}Hz, tts {np.median(tts_voiced):.0f}Hz)")
         y_shifted = pyrb.pitch_shift(y_tts, sr, shift)
         sf.write(output_path, y_shifted, sr)
         return output_path
 
-    # ── Time stretching ──────────────────────────────────────────────────────
+    # ── Time stretch ──────────────────────────────────────────────
 
-    def time_stretch_segment(
-        self,
-        input_path: str,
-        output_path: str,
-        target_duration_seconds: float,
-    ) -> str:
-        """
-        Time-stretch or compress the audio to match the target duration.
-        Uses pyrubberband for higher quality than librosa's phase vocoder.
-        """
+    def time_stretch_segment(self, input_path, output_path, target_duration):
         y, sr = librosa.load(input_path, sr=None)
-        current_duration = len(y) / sr
+        current = len(y) / sr
 
-        if abs(current_duration - target_duration_seconds) < 0.05:
+        if abs(current - target_duration) < 0.05:
             shutil.copy(input_path, output_path)
             return output_path
 
-        rate = current_duration / target_duration_seconds
-        rate = max(0.5, min(2.0, rate))
-
-        print(f"  Stretching: {current_duration:.2f}s → {target_duration_seconds:.2f}s (rate={rate:.2f})")
+        rate = max(0.5, min(2.0, current / target_duration))
 
         y_stretched = pyrb.time_stretch(y, sr, rate)
 
-        # Trim or pad to exact target length
-        target_samples = int(target_duration_seconds * sr)
-        if len(y_stretched) > target_samples:
-            y_stretched = y_stretched[:target_samples]
-        elif len(y_stretched) < target_samples:
-            y_stretched = np.pad(y_stretched, (0, target_samples - len(y_stretched)))
+        target_samples = int(target_duration * sr)
+        y_stretched = np.pad(y_stretched, (0, max(0, target_samples - len(y_stretched))))
+        y_stretched = y_stretched[:target_samples]
 
         sf.write(output_path, y_stretched, sr)
         return output_path
 
-    # ── Assembly ─────────────────────────────────────────────────────────────
+    # ── Assembly + mix ────────────────────────────────────────────
 
-    def assemble_vocal_track(
-        self,
-        segments: list[dict],
-        segment_audio_paths: list[str],
-        total_duration_seconds: float,
-        output_path: str,
-    ) -> str:
-        """
-        Place each generated segment at the correct timestamp to build
-        the full translated vocal track.
-        """
-        print("Assembling vocal track...")
+    def assemble_vocal_track(self, segments, paths, total_duration, output_path):
+        track = AudioSegment.silent(duration=int(total_duration * 1000))
 
-        total_ms = int(total_duration_seconds * 1000)
-        vocal_track = AudioSegment.silent(duration=total_ms)
+        for seg, path in zip(segments, paths):
+            audio = AudioSegment.from_file(path)
+            track = track.overlay(audio, position=int(seg["start"] * 1000))
 
-        for i, (seg, audio_path) in enumerate(zip(segments, segment_audio_paths)):
-            if not os.path.exists(audio_path):
-                print(f"  Warning: segment {i} audio not found, skipping")
-                continue
-
-            segment_audio = AudioSegment.from_file(audio_path)
-            start_ms = int(seg["start"] * 1000)
-
-            vocal_track = vocal_track.overlay(segment_audio, position=start_ms)
-            original = seg.get("text", "")
-            print(f"  Placed segment {i} at {seg['start']:.2f}s: '{original}' -> '{seg['translation']}'")
-
-        vocal_track.export(output_path, format="mp3")
-        print(f"Vocal track assembled: {output_path}")
+        track.export(output_path, format="mp3")
         return output_path
 
-    # ── Mixing ───────────────────────────────────────────────────────────────
-
-    def mix_with_instrumental(
-        self,
-        vocal_path: str,
-        instrumental_path: str,
-        output_path: str,
-        vocal_volume_db: float = 3.0,
-        instrumental_volume_db: float = -3.0,
-    ) -> str:
-        """Layer the translated vocal track over the instrumental."""
-        print("Mixing vocals with instrumental...")
-
+    def mix_with_instrumental(self, vocal_path, instrumental_path, output_path):
         vocals = AudioSegment.from_file(vocal_path)
-        instrumental = AudioSegment.from_file(instrumental_path)
+        inst = AudioSegment.from_file(instrumental_path)
 
-        vocals = vocals + vocal_volume_db
-        instrumental = instrumental + instrumental_volume_db
+        if len(vocals) < len(inst):
+            vocals += AudioSegment.silent(len(inst) - len(vocals))
+        else:
+            inst += AudioSegment.silent(len(vocals) - len(inst))
 
-        if len(vocals) < len(instrumental):
-            vocals = vocals + AudioSegment.silent(duration=len(instrumental) - len(vocals))
-        elif len(instrumental) < len(vocals):
-            instrumental = instrumental + AudioSegment.silent(duration=len(vocals) - len(instrumental))
-
-        final = instrumental.overlay(vocals)
+        final = inst.overlay(vocals)
         final.export(output_path, format="mp3")
-        print(f"Final mix exported: {output_path}")
         return output_path
 
-    # ── Full pipeline ────────────────────────────────────────────────────────
+    # ── Pipeline ──────────────────────────────────────────────────
 
     def run(
         self,
-        vocal_path: str,
-        instrumental_path: str,
-        segments: list[dict] = None,
-        output_path: str = "translated_song.mp3",
-        singer_name: str = "singer",
-        whisper_model: str = "medium",
-        voice_id: str = None,
-        pitch_correction: bool = True,
-        max_pitch_shift: float = 2.0,
-    ) -> str:
-        """
-        Run the full post-translation pipeline.
-
-        Pipeline: TTS → (optional pitch shift) → time stretch → assemble → mix
-
-        Args:
-            vocal_path: path to separated vocals (from demucs)
-            instrumental_path: path to separated instrumental
-            segments: list of {start, end, translation} dicts
-            output_path: where to write the final mp3
-            singer_name: name for the cloned voice
-            whisper_model: whisper model size for transcription
-            voice_id: pre-cloned ElevenLabs voice ID (skips cloning)
-            pitch_correction: whether to apply global pitch correction
-            max_pitch_shift: max pitch shift in semitones (default ±2)
-        """
+        vocal_path,
+        instrumental_path,
+        segments,
+        output_path="translated_song.mp3",
+        singer_name="singer",
+        voice_id=None,
+    ):
         with tempfile.TemporaryDirectory() as tmpdir:
 
-            # Step 0: Transcribe if no segments provided
-            if segments is None:
-                transcription = self.transcribe_vocals(vocal_path, model_size=whisper_model)
-                print("\nTranscription complete. Segments need translation before proceeding.")
-                print("Pass translated segments with 'translation' key to run().")
-                return transcription
+            if voice_id:
+                self.voice_id = voice_id
+            else:
+                self.clone_voice(vocal_path, singer_name, tmpdir)
 
-            # Track whether we cloned a new voice (so we know to clean it up)
-            cloned_here = False
+            paths = []
 
-            try:
-                # Step 1: Use pre-cloned voice or clone a new one
-                if voice_id:
-                    self.voice_id = voice_id
-                    print(f"Using pre-cloned voice: {self.voice_id}")
-                else:
-                    self.clone_voice(vocal_path, singer_name, tmpdir)
-                    cloned_here = True
+            for i, seg in enumerate(segments):
+                tts_path = os.path.join(tmpdir, f"seg_{i}.wav")
+                stretch_path = os.path.join(tmpdir, f"seg_{i}_stretch.wav")
 
-                # Step 2: Generate TTS, pitch correct, time-stretch each segment
-                segment_paths = []
-                for i, seg in enumerate(segments):
-                    tts_path = os.path.join(tmpdir, f"seg_{i}_tts.mp3")
-                    pitch_path = os.path.join(tmpdir, f"seg_{i}_pitch.wav")
-                    stretched_path = os.path.join(tmpdir, f"seg_{i}_stretched.wav")
-                    target_duration = seg["end"] - seg["start"]
-
-                    # Generate TTS
-                    self.generate_tts_segment(seg["translation"], tts_path)
-
-                    # Optional global pitch correction
-                    if pitch_correction:
-                        self.pitch_correct_segment(
-                            tts_path, vocal_path,
-                            seg["start"], seg["end"],
-                            pitch_path,
-                            max_shift_semitones=max_pitch_shift,
-                        )
-                    else:
-                        shutil.copy(tts_path, pitch_path)
-
-                    # Time-stretch to match original duration
-                    self.time_stretch_segment(pitch_path, stretched_path, target_duration)
-                    segment_paths.append(stretched_path)
-
-                # Step 3: Assemble vocal track
-                total_duration = max(seg["end"] for seg in segments) + 1.0
-                vocal_track_path = os.path.join(tmpdir, "translated_vocals.mp3")
-                self.assemble_vocal_track(
-                    segments, segment_paths, total_duration, vocal_track_path
+                self.generate_phrase_spliced_segment(
+                    seg["translation"],
+                    vocal_path,
+                    seg["start"],
+                    seg["end"],
+                    tts_path,
+                    tmpdir,
                 )
 
-                # Step 4: Mix with instrumental
-                self.mix_with_instrumental(
-                    vocal_track_path, instrumental_path, output_path,
+                self.time_stretch_segment(
+                    tts_path,
+                    stretch_path,
+                    seg["end"] - seg["start"]
                 )
-            finally:
-                # Clean up the cloned voice from ElevenLabs
-                if cloned_here:
-                    self.delete_voice()
-                self._tts_cache.clear()
+
+                paths.append(stretch_path)
+
+            vocal_track = os.path.join(tmpdir, "vocals.mp3")
+
+            self.assemble_vocal_track(
+                segments,
+                paths,
+                max(s["end"] for s in segments) + 1,
+                vocal_track
+            )
+
+            self.mix_with_instrumental(
+                vocal_track,
+                instrumental_path,
+                output_path
+            )
+
+            self.delete_voice()
 
         return output_path
-
-
-# ── Example usage ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import re
     import anthropic
+    import os
 
-    claude = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+    # ── Init Claude ─────────────────────────────────────────────
+    claude = anthropic.Anthropic(
+        api_key=os.environ.get("ANTHROPIC_API_KEY")
+    )
 
+    # ── Init Pipeline ───────────────────────────────────────────
     pipeline = AudioPipeline(
         elevenlabs_api_key=os.environ.get("ELEVENLABS_API_KEY", "sk_...")
     )
 
+    # ── Input Segments (original English) ───────────────────────
     segments = [
         {"start": 0.0, "end": 5.1, "text": "You wouldn't get this from any other guy."},
         {"start": 5.6, "end": 9.8, "text": "I just want to tell you how I'm feeling."},
@@ -440,48 +410,55 @@ if __name__ == "__main__":
         {"start": 82.9, "end": 84.6, "text": "Never gonna say goodbye."},
     ]
 
-    # ── Translate via Claude directly ─────────────────────────────────────
-    target_lang = "es"
-    text_cache = {}  # text -> translation (reuse for duplicate lyrics)
+    # ── Translation Setup ───────────────────────────────────────
+    target_lang = "Spanish"
+    text_cache = {}
 
-    # Deduplicate
     unique_texts = list({seg["text"] for seg in segments})
     total_segments = len(segments)
-    print(f"{total_segments} segments, {len(unique_texts)} unique lyrics to translate "
-          f"({total_segments - len(unique_texts)} duplicates skipped)")
+
+    print(
+        f"{total_segments} segments, {len(unique_texts)} unique lyrics "
+        f"({total_segments - len(unique_texts)} duplicates skipped)"
+    )
 
     def translate_line(text: str, lang: str = "Spanish") -> str:
-        syllable_count = max(1, len(re.findall(r'[aeiouAEIOU]+', text)))
+        syllable_count = max(1, len(re.findall(r"[aeiouAEIOU]+", text)))
+
         response = claude.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=128,
-            messages=[{"role": "user", "content": (
-                f"Translate this English song lyric into {lang}.\n"
-                f"Original: \"{text}\"\n"
-                f"Match the syllable count as closely as possible (~{syllable_count} syllables).\n"
-                f"Return ONLY the translated line, no explanation."
-            )}],
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Translate this English song lyric into {lang}.\n"
+                    f"Original: \"{text}\"\n"
+                    f"Match the syllable count as closely as possible (~{syllable_count}).\n"
+                    f"Return ONLY the translated line."
+                )
+            }],
         )
+
         return response.content[0].text.strip().strip('"')
 
-    print(f"Translating {len(unique_texts)} unique lines to {target_lang}...")
+    # ── Translate (deduplicated) ────────────────────────────────
+    print(f"Translating {len(unique_texts)} lines...")
+
     for text in unique_texts:
-        translation = translate_line(text)
+        translation = translate_line(text, target_lang)
         text_cache[text] = translation
         print(f"  '{text}' -> '{translation}'")
 
-    # Apply translations to all segments
+    # Apply translations
     for seg in segments:
         seg["translation"] = text_cache[seg["text"]]
 
-    # ── Run pipeline (will clone a fresh voice) ────────────────────────
+    # ── Run Pipeline ────────────────────────────────────────────
     result = pipeline.run(
         vocal_path="separated/htdemucs/test_song/vocals_short.wav",
         instrumental_path="separated/htdemucs/test_song/no_vocals_short.wav",
         segments=segments,
         output_path="translated_song.mp3",
-        pitch_correction=True,
-        max_pitch_shift=2.0,
     )
 
-    print(f"\nDone! Output: {result}")
+    print(f"\n✅ Done! Output: {result}")
