@@ -9,7 +9,7 @@ try:
 except ImportError:
     PYPHEN_AVAILABLE = False
 
-TOLERANCE = 1
+TOLERANCE = 0
 
 syllable_agent = Agent(
     name="syllable_critic",

@@ -34,7 +34,7 @@ from uagents_core.contrib.protocols.chat import (
 )
 from models import LyricLine, CritiqueResult, RevisionRequest, AcceptedLine
 
-MAX_ATTEMPTS = 4
+MAX_ATTEMPTS = 6
 ACCEPT_THRESHOLD = 0.70
 
 WEIGHTS = {

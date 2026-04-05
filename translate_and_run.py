@@ -53,6 +53,7 @@ _state = {
     "instrumental_path": "",
     "output_path": "",
     "elevenlabs_api_key": "",
+    "singer_name": "singer",
 }
 
 
@@ -119,7 +120,7 @@ def _run_audio_pipeline(ctx):
         instrumental_path=_state["instrumental_path"],
         segments=translated_segments,
         output_path=_state["output_path"],
-        singer_name="singer",
+        singer_name=_state["singer_name"],
     )
 
     ctx.logger.info(f"Done! Output: {_state['output_path']}")
@@ -133,6 +134,7 @@ if __name__ == "__main__":
     parser.add_argument("--target-lang",    default="es",              help="Target language code (default: es)")
     parser.add_argument("--output",         default="translated_song.mp3", help="Output file path")
     parser.add_argument("--elevenlabs-key", default=os.getenv("ELEVENLABS_API_KEY", ""), help="ElevenLabs API key")
+    parser.add_argument("--singer-name",    default="singer",              help="Singer name for voice clone (default: singer)")
     args = parser.parse_args()
 
     with open(args.segments) as f:
@@ -144,6 +146,7 @@ if __name__ == "__main__":
     _state["instrumental_path"] = args.instrumental
     _state["output_path"] = args.output
     _state["elevenlabs_api_key"] = args.elevenlabs_key
+    _state["singer_name"] = args.singer_name
 
     print(f"Loaded {len(segments)} segments from {args.segments}")
     print(f"Target language: {args.target_lang}")

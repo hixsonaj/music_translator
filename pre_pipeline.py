@@ -129,7 +129,9 @@ def transcribe(vocals_path: str, source_lang: str = "en", whisper_model: str = "
     Returns list of {"start", "end", "text"} dicts.
     """
     import hashlib
-    cache_path = vocals_path + ".whisper.json"
+    with open(vocals_path, "rb") as _f:
+        _file_hash = hashlib.md5(_f.read()).hexdigest()[:12]
+    cache_path = vocals_path + f".{_file_hash}.whisper.json"
     if os.path.exists(cache_path):
         print(f"Loading cached Whisper transcript: {cache_path}")
         with open(cache_path, "r") as f:
