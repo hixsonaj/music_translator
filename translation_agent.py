@@ -22,7 +22,7 @@ translation_agent = Agent(
 def call_llm(prompt: str) -> str:
     response = client.messages.create(
         model="claude-haiku-4-5-20251001",
-        max_tokens=128,
+        max_tokens=256,
         messages=[{"role": "user", "content": prompt}],
     )
     return response.content[0].text.strip()
@@ -34,7 +34,8 @@ async def initial_translate(ctx: Context, sender: str, msg: LyricLine):
     prompt = (
         f"Translate this English song lyric into {lang}.\n"
         f"Original: \"{msg.original}\"\n"
-        f"Match the syllable count as closely as possible (~{msg.target_syllables} syllables).\n"
+        f"The translation MUST have exactly {msg.target_syllables} syllables — this is a hard requirement for singing.\n"
+        f"Syllable count takes priority over literal meaning. Adjust wording, add or remove words, or paraphrase as needed to hit the exact count.\n"
         f"Return ONLY the translated line, no explanation."
     )
     translated = call_llm(prompt)
@@ -57,7 +58,8 @@ async def revise(ctx: Context, sender: str, msg: RevisionRequest):
         f"Original English: \"{msg.original}\"\n"
         f"Current translation (attempt {msg.attempt_number}): \"{msg.current_translation}\"\n"
         f"Problem: {msg.revision_prompt}\n"
-        f"Must have exactly {msg.target_syllables} syllables.\n"
+        f"The revised line MUST have exactly {msg.target_syllables} syllables — non-negotiable for singing.\n"
+        f"Syllable count takes priority over meaning. Paraphrase freely, but preserve the general theme.\n"
         f"Return ONLY the revised line, no explanation."
     )
     revised = call_llm(prompt)

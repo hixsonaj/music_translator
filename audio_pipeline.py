@@ -8,11 +8,12 @@ Pipeline:
   1. Clone the singer's voice from the separated vocal track
   2. Generate TTS for each translated line in the cloned voice
   3. Time-stretch each generated segment to match original duration
-  4. Reassemble all segments into a full vocal track
-  5. Mix translated vocals over the instrumental
+  4. Transfer the original segment's pitch contour onto the generated audio
+  5. Reassemble all segments into a full vocal track
+  6. Mix translated vocals over the instrumental
 
 Requirements:
-  pip install elevenlabs pydub librosa soundfile numpy
+  pip install elevenlabs pydub librosa soundfile numpy pyworld
 
 Usage:
   from audio_pipeline import AudioPipeline
@@ -37,6 +38,7 @@ from elevenlabs.client import ElevenLabs
 from pydub import AudioSegment
 import librosa
 import soundfile as sf
+import pyworld as pw
 
 
 class AudioPipeline:
@@ -153,7 +155,75 @@ class AudioPipeline:
         sf.write(output_path, y_stretched, sr)
         return output_path
 
-    # ── Step 4: Assemble all segments into a full vocal track ────────────────
+    # ── Step 4: Transfer pitch contour from original segment ─────────────────
+
+    def pitch_transfer(
+        self,
+        original_segment_path: str,
+        generated_path: str,
+        output_path: str,
+    ) -> str:
+        """
+        Apply the pitch contour of the original vocal segment onto the
+        generated (time-stretched) TTS audio.
+
+        The generated audio keeps its own timbre and spectral character
+        (i.e. the cloned voice), but now follows the melody the original
+        singer was hitting note-for-note.
+
+        Uses WORLD vocoder (pyworld):
+          - Decompose generated audio into F0, spectral envelope, aperiodicity
+          - Extract F0 from original segment
+          - Resample original F0 to match the generated audio's frame count
+          - Resynthesize with the transferred F0
+        """
+        # Load both audio files at their native sample rates
+        y_orig, sr_orig = librosa.load(original_segment_path, sr=None, mono=True)
+        y_gen,  sr_gen  = librosa.load(generated_path,        sr=None, mono=True)
+
+        # WORLD requires float64
+        y_orig_64 = y_orig.astype(np.float64)
+        y_gen_64  = y_gen.astype(np.float64)
+
+        # Decompose the generated audio with WORLD
+        f0_gen, sp_gen, ap_gen = pw.wav2world(y_gen_64, sr_gen)
+
+        # Extract F0 from the original segment using pyin (more accurate on singing)
+        f0_orig_raw, voiced_flag, _ = librosa.pyin(
+            y_orig_64,
+            fmin=librosa.note_to_hz("C2"),   # ~65 Hz — covers bass singers
+            fmax=librosa.note_to_hz("C6"),   # ~1047 Hz — covers soprano
+            sr=sr_orig,
+            frame_length=2048,
+        )
+
+        # Replace NaNs (unvoiced frames) with 0 — WORLD treats 0 as unvoiced
+        f0_orig_raw = np.nan_to_num(f0_orig_raw, nan=0.0)
+
+        # Resample original F0 to match the number of WORLD frames in the generated audio
+        n_frames_gen = len(f0_gen)
+        n_frames_orig = len(f0_orig_raw)
+
+        if n_frames_orig != n_frames_gen:
+            indices = np.linspace(0, n_frames_orig - 1, n_frames_gen)
+            f0_transferred = np.interp(indices, np.arange(n_frames_orig), f0_orig_raw)
+        else:
+            f0_transferred = f0_orig_raw.copy()
+
+        # Where original is unvoiced (0), keep generated F0 so the voice
+        # doesn't go silent on spoken/breathy parts of the translation
+        unvoiced = f0_transferred == 0.0
+        f0_transferred[unvoiced] = f0_gen[unvoiced]
+
+        # Resynthesize with transferred pitch
+        y_out = pw.synthesize(f0_transferred, sp_gen, ap_gen, sr_gen)
+        y_out = y_out.astype(np.float32)
+
+        sf.write(output_path, y_out, sr_gen)
+        print(f"  Pitch transferred: {Path(generated_path).name} → {Path(output_path).name}")
+        return output_path
+
+    # ── Step 5: Assemble all segments into a full vocal track ────────────────
 
     def assemble_vocal_track(
         self,
@@ -198,8 +268,8 @@ class AudioPipeline:
         vocal_path: str,
         instrumental_path: str,
         output_path: str,
-        vocal_volume_db: float = 10.0,
-        instrumental_volume_db: float = -100.0,
+        vocal_volume_db: float = 0.0,
+        instrumental_volume_db: float = -3.0,
     ) -> str:
         """
         Layer the translated vocal track over the instrumental.
@@ -256,18 +326,29 @@ class AudioPipeline:
             # Step 1: Clone voice
             self.clone_voice(vocal_path, singer_name)
 
-            # Step 2 & 3: Generate and time-stretch each segment
+            # Pre-load the full vocal track once for slicing original segments
+            full_vocals = AudioSegment.from_file(vocal_path)
+
+            # Step 2, 3 & 4: Generate, time-stretch, and pitch-transfer each segment
             segment_paths = []
             for i, seg in enumerate(segments):
-                raw_path = os.path.join(tmpdir, f"seg_{i}_raw.mp3")
-                stretched_path = os.path.join(tmpdir, f"seg_{i}_stretched.wav")
-                target_duration = seg["end"] - seg["start"]
+                raw_path          = os.path.join(tmpdir, f"seg_{i}_raw.mp3")
+                stretched_path    = os.path.join(tmpdir, f"seg_{i}_stretched.wav")
+                orig_seg_path     = os.path.join(tmpdir, f"seg_{i}_original.wav")
+                pitched_path      = os.path.join(tmpdir, f"seg_{i}_pitched.wav")
+                target_duration   = seg["end"] - seg["start"]
+
+                # Slice the original vocal segment for pitch reference
+                start_ms = int(seg["start"] * 1000)
+                end_ms   = int(seg["end"]   * 1000)
+                full_vocals[start_ms:end_ms].export(orig_seg_path, format="wav")
 
                 self.generate_tts_segment(seg["translation"], raw_path)
                 self.time_stretch_segment(raw_path, stretched_path, target_duration)
-                segment_paths.append(stretched_path)
+                self.pitch_transfer(orig_seg_path, stretched_path, pitched_path)
+                segment_paths.append(pitched_path)
 
-            # Step 4: Assemble vocal track
+            # Step 5: Assemble vocal track
             # Get total duration from the last segment end time
             total_duration = max(seg["end"] for seg in segments) + 1.0
             vocal_track_path = os.path.join(tmpdir, "translated_vocals.mp3")
@@ -275,7 +356,7 @@ class AudioPipeline:
                 segments, segment_paths, total_duration, vocal_track_path
             )
 
-            # Step 5: Mix with instrumental
+            # Step 6: Mix with instrumental
             self.mix_with_instrumental(vocal_track_path, instrumental_path, output_path, vocal_volume_db=10.0, instrumental_volume_db=-18.0)
 
         return output_path

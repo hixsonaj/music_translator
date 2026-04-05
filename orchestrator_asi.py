@@ -31,7 +31,7 @@ from uagents_core.contrib.protocols.chat import (
 )
 from models import LyricLine, CritiqueResult, RevisionRequest, AcceptedLine
 
-MAX_ATTEMPTS = 4
+MAX_ATTEMPTS = 8
 ACCEPT_THRESHOLD = 0.70
 
 WEIGHTS = {
@@ -224,10 +224,11 @@ async def handle_critique(ctx: Context, sender: str, msg: CritiqueResult):
     scores = {c["critic"]: 1.0 if c["passed"] else 0.0 for c in critiques}
     score = sum(WEIGHTS.get(c, 0.5) * scores.get(c, 0.0) for c in scores)
     attempt = state["attempt"]
+    syllable_passed = scores.get("syllable", 0.0) == 1.0
 
-    ctx.logger.info(f"Line {msg.line_id} attempt {attempt}: score={score:.0%}")
+    ctx.logger.info(f"Line {msg.line_id} attempt {attempt}: score={score:.0%} syllable_passed={syllable_passed}")
 
-    if score >= ACCEPT_THRESHOLD or attempt >= MAX_ATTEMPTS:
+    if (syllable_passed and score >= ACCEPT_THRESHOLD) or attempt >= MAX_ATTEMPTS:
         # Build reply based on whether this came from ASI:One or direct
         if state.get("is_chat"):
             lang_name = next(

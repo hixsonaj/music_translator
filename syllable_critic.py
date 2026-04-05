@@ -9,7 +9,7 @@ try:
 except ImportError:
     PYPHEN_AVAILABLE = False
 
-TOLERANCE = 1
+TOLERANCE = 0
 
 syllable_agent = Agent(
     name="syllable_critic",
@@ -31,14 +31,14 @@ def count_syllables(text: str, lang: str = "en") -> int:
             return total
         except Exception:
             pass
-    return max(1, len(re.findall(r'[aeiouAEIOU]+', text)))
+    return sum(max(1, len(re.findall(r'[aeiouAEIOU]+', word))) for word in text.split())
 
 
 @syllable_agent.on_message(model=LyricLine)
 async def critique(ctx: Context, sender: str, msg: LyricLine):
-    original_count = count_syllables(msg.original, "en")
+    target_count = msg.target_syllables
     translated_count = count_syllables(msg.translated, msg.target_lang)
-    delta = translated_count - original_count
+    delta = translated_count - target_count
     passed = abs(delta) <= TOLERANCE
 
     feedback = ""
@@ -46,10 +46,10 @@ async def critique(ctx: Context, sender: str, msg: LyricLine):
         direction = "fewer" if delta > 0 else "more"
         feedback = (
             f"Translation has {abs(delta)} {direction} syllable(s) than needed. "
-            f"Target: {original_count}, current: {translated_count}."
+            f"Target: {target_count}, current: {translated_count}."
         )
 
-    ctx.logger.info(f"Line {msg.line_id} | delta={delta:+d} passed={passed}")
+    ctx.logger.info(f"Line {msg.line_id} | target={target_count} got={translated_count} delta={delta:+d} passed={passed}")
 
     await ctx.send(sender, CritiqueResult(
         line_id=msg.line_id,
