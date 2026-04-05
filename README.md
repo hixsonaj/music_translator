@@ -1,5 +1,3 @@
-EXTREMLY VIBE CODING
-
 # Lyric Quality Agent System
 
 Multi-agent pipeline using Fetch.ai uAgents that negotiates translated lyrics

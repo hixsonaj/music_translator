@@ -45,6 +45,16 @@ class AudioPipeline:
         self.client = ElevenLabs(api_key=elevenlabs_api_key)
         self.voice_id = None  # Set after cloning
 
+    def delete_voice(self):
+        """Delete the cloned voice from ElevenLabs to free up voice slots."""
+        if not self.voice_id:
+            print("No voice to delete.")
+            return
+        
+        self.client.voices.delete(self.voice_id)
+        print(f"Deleted voice: {self.voice_id}")
+        self.voice_id = None
+
     # ── Step 1: Clone voice from vocal track ─────────────────────────────────
 
     def clone_voice(self, vocal_path: str, singer_name: str = "singer") -> str:
@@ -202,6 +212,8 @@ class AudioPipeline:
 
         vocals = AudioSegment.from_file(vocal_path)
         instrumental = AudioSegment.from_file(instrumental_path)
+
+        self.delete_voice()
 
         # Adjust volumes
         vocals = vocals + vocal_volume_db
