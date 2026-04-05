@@ -264,7 +264,7 @@ class AudioPipeline:
             )
 
             # Step 5: Mix with instrumental
-            self.mix_with_instrumental(vocal_track_path, instrumental_path, output_path, vocal_volume_db=10.0, instrumental_volume_db=-100.0)
+            self.mix_with_instrumental(vocal_track_path, instrumental_path, output_path, vocal_volume_db=10.0, instrumental_volume_db=-18.0)
 
         return output_path
 
@@ -274,7 +274,7 @@ class AudioPipeline:
 if __name__ == "__main__":
     # Example: run the full pipeline on a test song
     pipeline = AudioPipeline(
-        elevenlabs_api_key="sk_fba201774d3036e54b2008f3adbc59f9996fc0092dc120b0"
+        elevenlabs_api_key=os.getenv("ELEVENLABS_API_KEY")
     )
 
     # These come from demucs (vocal separation) + whisper + your translation agents
